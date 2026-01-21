@@ -1,0 +1,9 @@
+[project]
+name = "personal-model-deploy-to-modal"
+version = "0.1.0"
+description = "Personal platform for deploying SOTA ML models on Modal"
+requires-python = ">=3.10"
+dependencies = ["modal"]
+
+[project.optional-dependencies]
+dev = ["openai"]

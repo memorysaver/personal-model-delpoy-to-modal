@@ -13,7 +13,7 @@ Serve locally for testing:
 
 import modal
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from config import (
     APP_NAME,
@@ -22,8 +22,20 @@ from config import (
     OLLAMA_MAX_CONTAINERS,
     OLLAMA_SCALEDOWN,
     OLLAMA_TIMEOUT,
+    DIFFUSERS_A10G_MAX_CONTAINERS,
+    DIFFUSERS_A10G_SCALEDOWN,
+    DIFFUSERS_A10G_TIMEOUT,
+    DIFFUSERS_L40S_MAX_CONTAINERS,
+    DIFFUSERS_L40S_SCALEDOWN,
+    DIFFUSERS_L40S_TIMEOUT,
 )
 from backends.ollama import OllamaService, OllamaConfig
+from backends.diffusers import (
+    DiffusersConfig,
+    get_model_config,
+    get_supported_models,
+    get_models_by_gpu_tier,
+)
 
 # =============================================================================
 # Modal App
@@ -33,9 +45,11 @@ app = modal.App(APP_NAME)
 
 # Volumes for model storage
 ollama_volume = modal.Volume.from_name("ollama-models", create_if_missing=True)
+diffusers_volume = modal.Volume.from_name("diffusers-models", create_if_missing=True)
 
 # Backend configurations
 ollama_config = OllamaConfig()
+diffusers_config = DiffusersConfig()
 
 # =============================================================================
 # Container Images (separate for gateway vs backends)
@@ -57,6 +71,22 @@ ollama_image = (
         f"curl -L https://github.com/ollama/ollama/releases/download/{ollama_config.version}/ollama-linux-amd64.tar.zst -o /tmp/ollama.tar.zst",
         "tar --use-compress-program=unzstd -xf /tmp/ollama.tar.zst -C /usr",
         "rm /tmp/ollama.tar.zst",
+    )
+    .add_local_python_source("config")
+    .add_local_python_source("backends")
+)
+
+diffusers_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install("git")
+    .pip_install(
+        "torch",
+        # Install from git for GLM-Image pipeline support
+        "git+https://github.com/huggingface/diffusers.git",
+        "git+https://github.com/huggingface/transformers.git",
+        "accelerate",
+        "safetensors",
+        "sentencepiece",
     )
     .add_local_python_source("config")
     .add_local_python_source("backends")
@@ -126,6 +156,107 @@ class OllamaBackend:
 
 
 # =============================================================================
+# Diffusers Backends (GPU, separate lifecycle per tier)
+# =============================================================================
+
+
+@app.cls(
+    image=diffusers_image,
+    gpu="A10G",
+    volumes={diffusers_config.volume_mount: diffusers_volume},
+    max_containers=DIFFUSERS_A10G_MAX_CONTAINERS,
+    scaledown_window=DIFFUSERS_A10G_SCALEDOWN,
+    timeout=DIFFUSERS_A10G_TIMEOUT,
+)
+class DiffusersBackend_A10G:
+    """Diffusers backend on A10G GPU (24GB VRAM) for smaller models."""
+
+    @modal.enter()
+    def start(self):
+        """Initialize diffusers service on container startup."""
+        # Import here to avoid torch dependency in gateway
+        from backends.diffusers.backend import DiffusersService
+
+        self.service = DiffusersService(diffusers_config)
+        self.service.start()
+
+    @modal.method()
+    def generate(
+        self,
+        model_id: str,
+        prompt: str,
+        height: int | None = None,
+        width: int | None = None,
+        num_inference_steps: int | None = None,
+        guidance_scale: float | None = None,
+        seed: int | None = None,
+    ) -> dict:
+        """Generate image from text prompt."""
+        return self.service.generate(
+            model_id=model_id,
+            prompt=prompt,
+            height=height,
+            width=width,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            seed=seed,
+        )
+
+    @modal.method()
+    def health(self) -> dict:
+        """Health check for the diffusers backend."""
+        return self.service.health_check()
+
+
+@app.cls(
+    image=diffusers_image,
+    gpu="L40S",
+    volumes={diffusers_config.volume_mount: diffusers_volume},
+    max_containers=DIFFUSERS_L40S_MAX_CONTAINERS,
+    scaledown_window=DIFFUSERS_L40S_SCALEDOWN,
+    timeout=DIFFUSERS_L40S_TIMEOUT,
+)
+class DiffusersBackend_L40S:
+    """Diffusers backend on L40S GPU (48GB VRAM) for larger models."""
+
+    @modal.enter()
+    def start(self):
+        """Initialize diffusers service on container startup."""
+        # Import here to avoid torch dependency in gateway
+        from backends.diffusers.backend import DiffusersService
+
+        self.service = DiffusersService(diffusers_config)
+        self.service.start()
+
+    @modal.method()
+    def generate(
+        self,
+        model_id: str,
+        prompt: str,
+        height: int | None = None,
+        width: int | None = None,
+        num_inference_steps: int | None = None,
+        guidance_scale: float | None = None,
+        seed: int | None = None,
+    ) -> dict:
+        """Generate image from text prompt."""
+        return self.service.generate(
+            model_id=model_id,
+            prompt=prompt,
+            height=height,
+            width=width,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            seed=seed,
+        )
+
+    @modal.method()
+    def health(self) -> dict:
+        """Health check for the diffusers backend."""
+        return self.service.health_check()
+
+
+# =============================================================================
 # FastAPI Gateway
 # =============================================================================
 
@@ -139,6 +270,7 @@ async def health():
         "status": "healthy",
         "backends": {
             "ollama": {"status": "available"},
+            "diffusers": {"status": "available"},
         },
     }
 
@@ -152,6 +284,8 @@ async def root():
         "endpoints": {
             "/health": "Gateway health check",
             "/ollama/*": "Wildcard proxy to Ollama (native + OpenAI-compatible API)",
+            "/diffusers/models": "List supported diffusers models",
+            "/diffusers/generate": "Generate images (HuggingFace-style API)",
         },
         "ollama_examples": {
             "GET /ollama/api/tags": "List models (native)",
@@ -159,6 +293,10 @@ async def root():
             "POST /ollama/api/chat": "Chat completion (native)",
             "GET /ollama/v1/models": "List models (OpenAI)",
             "POST /ollama/v1/chat/completions": "Chat completion (OpenAI)",
+        },
+        "diffusers_examples": {
+            "GET /diffusers/models": "List supported models with GPU tier",
+            "POST /diffusers/generate": "Generate image from text prompt",
         },
     }
 
@@ -236,6 +374,105 @@ async def ollama_proxy(path: str, request: Request):
     # Non-streaming requests use .remote() (current behavior)
     result = OllamaBackend().proxy.remote(method, f"/{path}", body)
     return JSONResponse(content=result["body"], status_code=result["status_code"])
+
+
+# =============================================================================
+# Diffusers API (HuggingFace-style)
+# =============================================================================
+
+
+@gateway.get("/diffusers/models")
+async def diffusers_list_models():
+    """List supported diffusers models with their GPU tier.
+
+    This endpoint does not wake any GPU backend.
+    """
+    models = []
+    for model_id in get_supported_models():
+        config = get_model_config(model_id)
+        models.append({
+            "model_id": model_id,
+            "gpu_tier": config["gpu_tier"],
+            "defaults": config["defaults"],
+        })
+    return {"models": models}
+
+
+@gateway.post("/diffusers/generate")
+async def diffusers_generate(request: Request):
+    """Generate image from text prompt using diffusers.
+
+    Request body:
+        model_id: HuggingFace model identifier (required)
+        inputs: Text prompt for generation (required)
+        parameters: Optional generation parameters (height, width, etc.)
+
+    Returns:
+        Raw PNG image bytes (HuggingFace Inference API style)
+        Content-Type: image/png
+    """
+    body = await request.json()
+
+    # Validate required fields
+    model_id = body.get("model_id")
+    if not model_id:
+        return JSONResponse(
+            content={"error": "model_id is required"},
+            status_code=400,
+        )
+
+    inputs = body.get("inputs")
+    if not inputs:
+        return JSONResponse(
+            content={"error": "inputs (prompt) is required"},
+            status_code=400,
+        )
+
+    # Validate model is supported (gateway validation - no GPU wake)
+    model_config = get_model_config(model_id)
+    if model_config is None:
+        supported = get_supported_models()
+        return JSONResponse(
+            content={
+                "error": f"Unsupported model: {model_id}",
+                "supported_models": supported,
+            },
+            status_code=400,
+        )
+
+    # Extract optional parameters
+    params = body.get("parameters", {})
+
+    # Route to appropriate GPU tier backend
+    gpu_tier = model_config["gpu_tier"]
+    if gpu_tier == "a10g":
+        image_bytes = DiffusersBackend_A10G().generate.remote(
+            model_id=model_id,
+            prompt=inputs,
+            height=params.get("height"),
+            width=params.get("width"),
+            num_inference_steps=params.get("num_inference_steps"),
+            guidance_scale=params.get("guidance_scale"),
+            seed=params.get("seed"),
+        )
+    elif gpu_tier == "l40s":
+        image_bytes = DiffusersBackend_L40S().generate.remote(
+            model_id=model_id,
+            prompt=inputs,
+            height=params.get("height"),
+            width=params.get("width"),
+            num_inference_steps=params.get("num_inference_steps"),
+            guidance_scale=params.get("guidance_scale"),
+            seed=params.get("seed"),
+        )
+    else:
+        return JSONResponse(
+            content={"error": f"Unknown GPU tier: {gpu_tier}"},
+            status_code=500,
+        )
+
+    # Return raw PNG bytes (HuggingFace Inference API style)
+    return Response(content=image_bytes, media_type="image/png")
 
 
 # =============================================================================

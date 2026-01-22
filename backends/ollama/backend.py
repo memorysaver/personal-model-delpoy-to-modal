@@ -6,6 +6,8 @@ import time
 
 import httpx
 
+from typing import Iterator
+
 from backends.base import BaseBackend
 from backends import register_backend
 from backends.ollama.config import OllamaConfig
@@ -172,3 +174,22 @@ class OllamaService(BaseBackend):
                 return {"status_code": response.status_code, "body": response.json()}
             except Exception:
                 return {"status_code": response.status_code, "body": response.text}
+
+    def stream_proxy(self, path: str, body: dict) -> Iterator[bytes]:
+        """Stream proxy for SSE responses.
+
+        Yields raw bytes from Ollama's streaming response.
+        Use with Modal's .remote_gen() to maintain CPU/GPU separation.
+
+        Args:
+            path: Request path (e.g., '/api/generate', '/v1/chat/completions')
+            body: Request body (should include stream: true)
+
+        Yields:
+            Raw bytes from Ollama's streaming response
+        """
+        url = f"http://localhost:{self.config.port}{path}"
+        with httpx.Client(timeout=600.0) as client:
+            with client.stream("POST", url, json=body) as response:
+                for chunk in response.iter_bytes():
+                    yield chunk

@@ -13,7 +13,7 @@ Serve locally for testing:
 
 import modal
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from config import (
     APP_NAME,
@@ -117,6 +117,11 @@ class OllamaBackend:
         """Generic proxy to forward requests to local Ollama server."""
         return self.service.proxy(method, path, body)
 
+    @modal.method()
+    def stream_proxy(self, path: str, body: dict):
+        """Streaming proxy - use with .remote_gen() for SSE support."""
+        yield from self.service.stream_proxy(path, body)
+
 
 # =============================================================================
 # FastAPI Gateway
@@ -161,17 +166,34 @@ async def root():
 # =============================================================================
 
 
+def is_streaming_request(body: dict | None) -> bool:
+    """Check if request wants streaming response."""
+    if body is None:
+        return False
+    return body.get("stream", False) is True
+
+
 @gateway.api_route("/ollama/{path:path}", methods=["GET", "POST", "DELETE"])
 async def ollama_proxy(path: str, request: Request):
     """Proxy all Ollama requests to the backend.
 
     Supports both native Ollama API (/api/*) and OpenAI-compatible API (/v1/*).
+    Streaming requests (stream: true) use .remote_gen() for true SSE support.
     """
     method = request.method
     body = None
     if method == "POST":
         body = await request.json()
 
+    # Streaming requests use .remote_gen() for true SSE support
+    if is_streaming_request(body):
+        return StreamingResponse(
+            OllamaBackend().stream_proxy.remote_gen(f"/{path}", body),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+
+    # Non-streaming requests use .remote() (current behavior)
     result = OllamaBackend().proxy.remote(method, f"/{path}", body)
     return JSONResponse(content=result["body"], status_code=result["status_code"])
 
